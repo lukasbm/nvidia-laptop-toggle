@@ -1,0 +1,18 @@
+nvidia-compute-toggle is an independent implementation inspired by
+donfreiday/nvidia-disable:
+
+  https://github.com/donfreiday/nvidia-disable
+
+It is not a git fork and does not include the upstream repository's history.
+The upstream project documents the PCI remove/rescan + D3cold technique for
+permanently disabling a faulty dGPU on the XPS 15 9570. This project applies the
+same low-level technique to the opposite use case: keeping the dGPU available
+for on-demand CUDA.
+
+At the time of writing, the upstream repository has no LICENSE file, so its code
+is under default copyright. This project's original code is MIT-licensed; it
+does not relicense upstream code. If you want to copy code from the upstream
+project, ask its author for permission or terms.
+
+The technique itself (removing a PCI device and rescanning the bus) and standard
+systemd unit patterns are not claimed as original.

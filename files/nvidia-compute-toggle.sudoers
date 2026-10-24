@@ -1,0 +1,10 @@
+# Managed by nvidia-compute-toggle.
+#
+# Allows the desktop user in the wheel group to power the dGPU on/off from the
+# GNOME Quick Settings extension without a password prompt.  The helper accepts
+# only on/off/toggle and executes the installed nvidia-compute CLI as root.
+#
+# This is intentionally narrower than full sudo access, but it does let any
+# process running as a wheel user toggle the GPU.  Remove this file if you do
+# not want that.
+%wheel ALL=(root) NOPASSWD: /usr/local/libexec/nvidia-compute-helper on, /usr/local/libexec/nvidia-compute-helper off, /usr/local/libexec/nvidia-compute-helper toggle

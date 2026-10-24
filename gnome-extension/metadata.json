@@ -1,0 +1,7 @@
+{
+  "uuid": "nvidia-compute-toggle@lukas",
+  "name": "NVIDIA Compute Toggle",
+  "description": "Power the NVIDIA dGPU on/off for CUDA from GNOME Quick Settings.",
+  "shell-version": ["50", "51"],
+  "version": 1
+}

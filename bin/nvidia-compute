@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# nvidia-compute - on-demand CUDA dGPU control for muxless Optimus laptops.
+#
+# The iGPU owns the display.  This CLI powers the dGPU up for CUDA and removes
+# it from the PCI bus again when done.
+set -euo pipefail
+
+CONFIG=${NVIDIA_COMPUTE_CONFIG:-/etc/nvidia-compute-toggle.conf}
+DGPU_PCI=""
+DGPU_BRIDGE=""
+DGPU_NAME=""
+
+usage() {
+    cat <<'EOF'
+Usage: nvidia-compute COMMAND
+
+Commands:
+  status   Show dGPU, bridge, module, device, and battery state.
+  state    Print state=on|off|transition for scripts and desktop toggles.
+  on       Rescan PCI if needed, load nvidia + nvidia_uvm, verify with nvidia-smi.
+  off      Refuse if CUDA processes run; unload modules, remove the PCI device.
+  toggle   Run "off" if the dGPU is present, otherwise "on".
+  doctor   Check the installed configuration and report problems.
+
+The display stays on the iGPU.  This is not PRIME/Optimus graphics offload.
+EOF
+}
+
+msg()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+load_config() {
+    [ -r "$CONFIG" ] || die "missing $CONFIG; run the installer first"
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    : "${DGPU_PCI:?DGPU_PCI missing from $CONFIG}"
+    : "${DGPU_BRIDGE:?DGPU_BRIDGE missing from $CONFIG}"
+    [[ "$DGPU_PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] ||
+        die "invalid DGPU_PCI in $CONFIG: $DGPU_PCI"
+    [[ "$DGPU_BRIDGE" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] ||
+        die "invalid DGPU_BRIDGE in $CONFIG: $DGPU_BRIDGE"
+}
+
+run_root() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+prime_sudo() {
+    if [ "$EUID" -ne 0 ]; then
+        sudo -v || die "sudo authentication failed"
+    fi
+}
+
+gpu_present() {
+    [ -e "/sys/bus/pci/devices/$DGPU_PCI" ]
+}
+
+readfile() {
+    cat "$1" 2>/dev/null || true
+}
+
+bridge_state() {
+    readfile "/sys/bus/pci/devices/$DGPU_BRIDGE/power_state"
+}
+
+module_loaded() {
+    lsmod | awk '{print $1}' | grep -qx "$1"
+}
+
+nvidia_modules() {
+    lsmod | awk '$1 ~ /^nvidia/ {printf "%s ", $1}' | sed 's/ $//'
+}
+
+module_license() {
+    modinfo -F license nvidia 2>/dev/null || true
+}
+
+battery() {
+    command -v upower >/dev/null 2>&1 || return 0
+    local bat rate
+    bat=$(upower -e 2>/dev/null | grep -i battery | head -1 || true)
+    [ -n "$bat" ] || return 0
+    rate=$(upower -i "$bat" 2>/dev/null |
+        awk -F': *' '/energy-rate/ {print $2; exit}' || true)
+    [ -n "$rate" ] && msg "battery: $rate"
+}
+
+rail_report() {
+    msg "Bridge:  $(bridge_state) / $(readfile "/sys/bus/pci/devices/$DGPU_BRIDGE/power/runtime_status")"
+    battery
+}
+
+status() {
+    load_config
+    local mods devs
+    if gpu_present; then
+        local drv
+        drv=$(readlink "/sys/bus/pci/devices/$DGPU_PCI/driver" 2>/dev/null || true)
+        [ -n "$drv" ] && drv=${drv##*/} || drv=none
+        msg "GPU:     present on the bus (driver: $drv)"
+        msg "  state:   $(readfile "/sys/bus/pci/devices/$DGPU_PCI/power_state") / $(readfile "/sys/bus/pci/devices/$DGPU_PCI/power/runtime_status")"
+    else
+        msg "GPU:     removed from the bus"
+    fi
+    msg "Bridge:  $(bridge_state) / $(readfile "/sys/bus/pci/devices/$DGPU_BRIDGE/power/runtime_status")"
+    [ -n "$DGPU_NAME" ] && msg "Name:    $DGPU_NAME"
+
+    mods=$(nvidia_modules)
+    devs=$(find /dev -maxdepth 1 -name 'nvidia*' -printf '%p\n' 2>/dev/null |
+        sort | tr '\n' ' ' | sed 's/ $//' || true)
+    msg "Modules: $mods"
+    if [ -n "$devs" ] && [ -z "$mods" ]; then
+        msg "Devices: $devs (stale nodes; no driver loaded)"
+    else
+        msg "Devices: $devs"
+    fi
+
+    local lic
+    lic=$(module_license)
+    if [ -n "$lic" ]; then
+        case "$lic" in
+            *"Dual MIT/GPL"*)
+                msg "Driver:  nvidia-open ($lic) - Pascal is not supported"
+                ;;
+            *)
+                msg "Driver:  $lic"
+                ;;
+        esac
+    fi
+    battery
+}
+
+state() {
+    load_config
+
+    local gpu=0 mod=0 bridge
+    gpu_present && gpu=1
+    [ -e /sys/module/nvidia ] && mod=1
+    bridge=$(bridge_state)
+
+    if [ "$gpu" -eq 0 ] && [ "$mod" -eq 0 ] && [ "$bridge" = "D3cold" ]; then
+        msg "state=off"
+        return 1
+    elif [ "$gpu" -eq 1 ] && [ "$mod" -eq 1 ]; then
+        msg "state=on"
+        return 0
+    else
+        msg "state=transition"
+        return 2
+    fi
+}
+
+on() {
+    load_config
+
+    if lsmod | awk '{print $1}' | grep -Eq '^(nouveau|nova_core)$'; then
+        die "nouveau/nova_core is still loaded; reboot once so the kernel arguments apply"
+    fi
+
+    local lic
+    lic=$(module_license)
+    [ -n "$lic" ] || die "no nvidia module for $(uname -r); see the driver setup docs"
+    case "$lic" in
+        *"Dual MIT/GPL"*)
+            die "nvidia-open is installed; Pascal needs the proprietary 580xx module"
+            ;;
+    esac
+
+    if ! gpu_present; then
+        prime_sudo
+        msg "rescanning PCI bus for $DGPU_PCI ..."
+        run_root sh -c 'echo 1 > /sys/bus/pci/rescan' ||
+            die "PCI rescan failed"
+        for _ in {1..50}; do
+            gpu_present && break
+            sleep 0.1
+        done
+        gpu_present || die "$DGPU_PCI did not appear after rescan"
+    fi
+
+    local drv
+    drv=$(readlink "/sys/bus/pci/devices/$DGPU_PCI/driver" 2>/dev/null || true)
+    if [ "${drv##*/}" = "nouveau" ]; then
+        die "nouveau is bound to the GPU; reboot once after installing the driver"
+    fi
+
+    prime_sudo
+    msg "loading nvidia + nvidia_uvm ..."
+    run_root modprobe nvidia || die "modprobe nvidia failed"
+    run_root modprobe nvidia_uvm || die "modprobe nvidia_uvm failed"
+
+    # Device nodes can be stale from a previous load. Wait for the driver to
+    # actually bind and for nvidia_uvm to be loaded before trusting them.
+    for _ in {1..50}; do
+        drv=$(readlink "/sys/bus/pci/devices/$DGPU_PCI/driver" 2>/dev/null || true)
+        if [ "${drv##*/}" = "nvidia" ] &&
+           module_loaded nvidia &&
+           module_loaded nvidia_uvm; then
+            break
+        fi
+        sleep 0.1
+    done
+    [ "${drv##*/}" = "nvidia" ] || die "nvidia did not bind to $DGPU_PCI"
+    module_loaded nvidia_uvm || die "nvidia_uvm is not loaded"
+
+    for _ in {1..50}; do
+        [ -e /dev/nvidia0 ] && [ -e /dev/nvidia-uvm ] && break
+        sleep 0.1
+    done
+
+    if [ ! -e /dev/nvidia0 ] || [ ! -e /dev/nvidia-uvm ]; then
+        if command -v nvidia-modprobe >/dev/null 2>&1; then
+            run_root nvidia-modprobe -u -c 0 || true
+            sleep 0.5
+        fi
+    fi
+
+    [ -e /dev/nvidia0 ] || die "/dev/nvidia0 is missing"
+    [ -e /dev/nvidia-uvm ] || die "/dev/nvidia-uvm is missing"
+
+    msg "GPU is on:"
+    timeout 15 nvidia-smi --query-gpu=name,memory.total,driver_version \
+        --format=csv,noheader ||
+        die "nvidia-smi cannot talk to the GPU (check: journalctl -b -k | grep -i nvidia)"
+    msg "Display remains on the iGPU."
+}
+
+unload_modules() {
+    local m
+    for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+        if module_loaded "$m"; then
+            msg "unloading $m ..."
+            run_root modprobe -r "$m" || return 1
+        fi
+    done
+}
+
+off() {
+    load_config
+
+    if ! gpu_present; then
+        msg "GPU already off the bus"
+        if lsmod | awk '{print $1}' | grep -q '^nvidia'; then
+            prime_sudo
+            unload_modules || die "could not unload nvidia modules; refusing to claim success"
+        fi
+        rail_report
+        return 0
+    fi
+
+    prime_sudo
+
+    if module_loaded nvidia; then
+        command -v nvidia-smi >/dev/null 2>&1 ||
+            die "nvidia is loaded but nvidia-smi is missing; cannot check for CUDA processes"
+        local procs
+        if ! procs=$(timeout 5 nvidia-smi --query-compute-apps=pid,process_name \
+            --format=csv,noheader 2>/dev/null); then
+            die "nvidia-smi failed while the driver is loaded; refusing to power off"
+        fi
+        if [ -n "$procs" ]; then
+            printf 'CUDA processes are still running:\n%s\n' "$procs" >&2
+            die "stop them first; refusing to power off"
+        fi
+    fi
+
+    unload_modules || die "could not unload all nvidia modules; refusing to remove the device"
+    if lsmod | awk '{print $1}' | grep -q '^nvidia'; then
+        die "nvidia modules are still loaded; refusing to remove the device"
+    fi
+
+    msg "removing $DGPU_PCI from the PCI bus ..."
+    run_root sh -c "echo 1 > /sys/bus/pci/devices/$DGPU_PCI/remove" ||
+        die "failed to remove $DGPU_PCI from the PCI bus"
+
+    local state=""
+    for _ in {1..50}; do
+        state=$(bridge_state)
+        [ "$state" = "D3cold" ] && break
+        sleep 0.1
+    done
+
+    if [ "$state" != "D3cold" ]; then
+        die "bridge $DGPU_BRIDGE is ${state:-unknown}, expected D3cold"
+    fi
+
+    msg "GPU off; bridge $DGPU_BRIDGE is D3cold."
+    battery
+}
+
+FAILS=0
+pass() { printf '  ok    %s\n' "$*"; }
+fail() { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+note() { printf '  --    %s\n' "$*"; }
+
+doctor() {
+    load_config
+
+    printf '\nnvidia-compute-toggle doctor\n\n'
+
+    if [ -e "/sys/bus/pci/devices/$DGPU_BRIDGE" ]; then
+        pass "parent bridge $DGPU_BRIDGE exists"
+    else
+        fail "parent bridge $DGPU_BRIDGE does not exist"
+    fi
+
+    if gpu_present; then
+        note "dGPU is present (on state)"
+    else
+        pass "dGPU is removed from the bus"
+        if [ "$(bridge_state)" = "D3cold" ]; then
+            pass "bridge $DGPU_BRIDGE is D3cold"
+        else
+            fail "bridge $DGPU_BRIDGE is $(bridge_state), expected D3cold"
+        fi
+    fi
+
+    local lic
+    lic=$(module_license)
+    if [ -z "$lic" ]; then
+        fail "no nvidia module for $(uname -r)"
+    elif [[ "$lic" == *"Dual MIT/GPL"* ]]; then
+        fail "nvidia-open is installed; Pascal needs the proprietary 580xx module"
+    else
+        pass "nvidia module license: $lic"
+    fi
+
+    if [ "$(systemctl is-enabled nvidia-compute-off.service 2>/dev/null || true)" = "enabled" ]; then
+        pass "nvidia-compute-off.service is enabled"
+    else
+        fail "nvidia-compute-off.service is not enabled"
+    fi
+
+    local after before
+    after=$(systemctl show nvidia-compute-off.service -p After 2>/dev/null || true)
+    before=$(systemctl show nvidia-compute-off.service -p Before 2>/dev/null || true)
+
+    if printf '%s' "$after" | grep -q 'multi-user.target'; then
+        fail "unit has After=multi-user.target (ordering cycle risk)"
+    else
+        pass "unit has no After=multi-user.target"
+    fi
+    if printf '%s' "$after" | grep -q 'akmods.service'; then
+        pass "unit runs after akmods.service"
+    else
+        fail "unit is not ordered after akmods.service"
+    fi
+    if printf '%s' "$before" | grep -Eq 'gdm.service|display-manager.service'; then
+        pass "unit runs before the display manager"
+    else
+        note "unit is not explicitly ordered before the display manager"
+    fi
+
+    local unit
+    for unit in nvidia-fallback.service nvidia-persistenced.service nvidia-powerd.service; do
+        if ! systemctl cat "$unit" >/dev/null 2>&1; then
+            note "$unit is not installed"
+        elif [ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "masked" ]; then
+            pass "$unit is masked"
+        else
+            fail "$unit is not masked"
+        fi
+    done
+
+    if grep -qw 'rd.driver.blacklist=nouveau' /proc/cmdline &&
+       grep -qw 'modprobe.blacklist=nouveau' /proc/cmdline; then
+        pass "nouveau blacklist is on the kernel command line"
+    else
+        fail "nouveau blacklist is missing from /proc/cmdline"
+    fi
+
+    local taint
+    taint=$(readfile /proc/sys/kernel/tainted)
+    if [ "$taint" = "0" ]; then
+        pass "kernel is not tainted"
+    elif [ -n "$taint" ] && [ $((taint & 512)) -ne 0 ] 2>/dev/null; then
+        fail "kernel taint $taint includes a WARNING; check journalctl -b -k"
+    else
+        note "kernel taint is ${taint:-unknown} (not a WARNING)"
+    fi
+
+    printf '\n'
+    if [ "$FAILS" -eq 0 ]; then
+        printf 'All checks passed.\n\n'
+    else
+        printf '%d check(s) failed.\n\n' "$FAILS"
+        return 1
+    fi
+}
+
+toggle() {
+    load_config
+    if gpu_present; then
+        off
+    else
+        on
+    fi
+}
+
+case "${1:-}" in
+    status)  status ;;
+    state)   state ;;
+    on)      on ;;
+    off)     off ;;
+    toggle)  toggle ;;
+    doctor)  doctor ;;
+    -h|--help|help|"") usage ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

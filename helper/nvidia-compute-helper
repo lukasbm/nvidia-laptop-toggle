@@ -1,0 +1,14 @@
+#!/bin/sh
+# Root-only helper for the GNOME Quick Settings toggle.
+# Installed root-owned; sudoers allows only these three actions.
+set -eu
+
+case "${1:-}" in
+    on|off|toggle)
+        exec /usr/local/bin/nvidia-compute "$1"
+        ;;
+    *)
+        echo "usage: $0 on|off|toggle" >&2
+        exit 2
+        ;;
+esac

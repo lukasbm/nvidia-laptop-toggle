@@ -1,0 +1,20 @@
+[Unit]
+Description=Power off the NVIDIA dGPU for compute-only use
+Documentation=file:/usr/share/doc/nvidia-compute-toggle/README.md
+# Let akmods build the module while the dGPU is still visible.  RPMFusion's
+# legacy akmod chooses between the proprietary and open module at build time
+# by inspecting lspci.
+After=akmods.service
+# Remove the GPU before GDM/Wayland starts, so the display stack never probes it.
+Before=display-manager.service
+ConditionPathExists=/sys/bus/pci/devices/@DGPU_PCI@
+
+[Service]
+Type=oneshot
+# A missing power/wakeup attribute must not prevent the remove below.
+ExecStart=-/bin/sh -c 'echo "disabled" > /sys/bus/pci/devices/@DGPU_PCI@/power/wakeup'
+ExecStart=/bin/sh -c 'echo "1" > /sys/bus/pci/devices/@DGPU_PCI@/remove'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
